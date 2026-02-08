@@ -13,6 +13,7 @@ const VIALRGB_EFFECT_SOLID_COLOR: u16 = 2;
 
 const CMD_VIA_LIGHTING_SET_VALUE: u8 = 0x07;
 const CMD_VIA_LIGHTING_GET_VALUE: u8 = 0x08;
+const CMD_VIA_LIGHTING_SAVE: u8 = 0x09;
 
 const VIALRGB_GET_INFO: u8 = 0x40;
 const VIALRGB_GET_SUPPORTED: u8 = 0x42;
@@ -31,6 +32,10 @@ struct Cli {
     /// Override brightness/value (0-255). If not set, uses the color's own brightness.
     #[arg(short, long)]
     brightness: Option<u8>,
+
+    /// Don't save the setting to the keyboard's EEPROM (temporary until reboot).
+    #[arg(long)]
+    no_save: bool,
 }
 
 fn hid_send(dev: &HidDevice, msg: &[u8], retries: u32) -> Result<[u8; MSG_LEN]> {
@@ -149,54 +154,58 @@ fn vialrgb_set_mode(dev: &HidDevice, mode: u16, speed: u8, h: u8, s: u8, v: u8) 
     Ok(())
 }
 
-#[allow(clippy::many_single_char_names)]
+fn vialrgb_save(dev: &HidDevice) -> Result<()> {
+    hid_send(dev, &[CMD_VIA_LIGHTING_SAVE], 20)?;
+    Ok(())
+}
+
 fn hex_to_hsv(hex: &str) -> Result<(u8, u8, u8)> {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
     if hex.len() != 6 || !hex.is_ascii() {
         bail!("color must be 6 hex characters (0-9, a-f), e.g. ff00ff");
     }
 
-    let r = u8::from_str_radix(&hex[0..2], 16).context("invalid red component")?;
-    let g = u8::from_str_radix(&hex[2..4], 16).context("invalid green component")?;
-    let b = u8::from_str_radix(&hex[4..6], 16).context("invalid blue component")?;
+    let red = f64::from(u8::from_str_radix(&hex[0..2], 16).context("invalid red component")?);
+    let green = f64::from(u8::from_str_radix(&hex[2..4], 16).context("invalid green component")?);
+    let blue = f64::from(u8::from_str_radix(&hex[4..6], 16).context("invalid blue component")?);
 
-    let rf = f64::from(r) / 255.0;
-    let gf = f64::from(g) / 255.0;
-    let bf = f64::from(b) / 255.0;
+    let red = red / 255.0;
+    let green = green / 255.0;
+    let blue = blue / 255.0;
 
-    let max = rf.max(gf).max(bf);
-    let delta = max - rf.min(gf).min(bf);
+    let max = red.max(green).max(blue);
+    let delta = max - red.min(green).min(blue);
 
     let hue = if delta < f64::EPSILON {
         0.0
-    } else if (max - rf).abs() < f64::EPSILON {
-        60.0 * ((gf - bf) / delta).rem_euclid(6.0)
-    } else if (max - gf).abs() < f64::EPSILON {
-        60.0 * (((bf - rf) / delta) + 2.0)
+    } else if (max - red).abs() < f64::EPSILON {
+        60.0 * ((green - blue) / delta).rem_euclid(6.0)
+    } else if (max - green).abs() < f64::EPSILON {
+        60.0 * (((blue - red) / delta) + 2.0)
     } else {
-        60.0 * (((rf - gf) / delta) + 4.0)
+        60.0 * (((red - green) / delta) + 4.0)
     };
 
     let sat = if max < f64::EPSILON { 0.0 } else { delta / max };
 
     // Values are guaranteed to be in 0.0..=255.0 by the HSV math above
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (h, s, v) = (
+    let (hue, sat, val) = (
         (hue / 360.0 * 255.0).round() as u8,
         (sat * 255.0).round() as u8,
         (max * 255.0).round() as u8,
     );
 
-    Ok((h, s, v))
+    Ok((hue, sat, val))
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let (h, s, mut v) = hex_to_hsv(&cli.color)?;
+    let (hue, sat, mut val) = hex_to_hsv(&cli.color)?;
 
     if let Some(brightness) = cli.brightness {
-        v = brightness;
+        val = brightness;
     }
 
     let api = HidApi::new().context("failed to initialize HID API")?;
@@ -218,10 +227,16 @@ fn main() -> Result<()> {
     );
 
     let color_hex = cli.color.trim_start_matches('#');
-    println!("Setting color to #{color_hex} (HSV: {h}, {s}, {v})");
+    println!("Setting color to #{color_hex} (HSV: {hue}, {sat}, {val})");
 
-    vialrgb_set_mode(&dev, VIALRGB_EFFECT_SOLID_COLOR, 128, h, s, v)?;
+    vialrgb_set_mode(&dev, VIALRGB_EFFECT_SOLID_COLOR, 128, hue, sat, val)?;
 
-    println!("Done!");
+    if cli.no_save {
+        println!("Done! (not saved to EEPROM)");
+    } else {
+        vialrgb_save(&dev)?;
+        println!("Done! (saved to EEPROM)");
+    }
+
     Ok(())
 }
