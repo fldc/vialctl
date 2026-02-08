@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,7 +37,7 @@ jobs:
         if: ${{ !matrix.cross }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y libhidapi-dev
+          sudo apt-get install -y libudev-dev libhidapi-dev
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
