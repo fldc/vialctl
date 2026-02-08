@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use hidapi::{DeviceInfo, HidApi, HidDevice};
+use serde::Deserialize;
 
 const MSG_LEN: usize = 32;
 const VIAL_SERIAL_NUMBER_MAGIC: &str = "vial:f64c2b3c";
@@ -19,23 +22,96 @@ const VIALRGB_GET_INFO: u8 = 0x40;
 const VIALRGB_GET_SUPPORTED: u8 = 0x42;
 const VIALRGB_SET_MODE: u8 = 0x41;
 
+const DEFAULT_EFFECT_SPEED: u8 = 128;
+
+const MAX_EFFECT_QUERY_ROUNDS: usize = 100;
+
+#[derive(Deserialize, Default)]
+struct Config {
+    white_point: Option<[u8; 3]>,
+}
+
+fn load_config() -> Config {
+    let Some(config_dir) = dirs::config_dir() else {
+        return Config::default();
+    };
+    let path = config_dir.join("vialctl").join("config.toml");
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return Config::default();
+    };
+    match toml::from_str(&contents) {
+        Ok(config) => {
+            let config: Config = config;
+            if let Some([r, g, b]) = config.white_point
+                && (r == 0 || g == 0 || b == 0)
+            {
+                eprintln!(
+                    "warning: ignoring white_point in {}: channels must be 1-255",
+                    path.display()
+                );
+                return Config { white_point: None };
+            }
+            config
+        }
+        Err(e) => {
+            eprintln!("warning: ignoring invalid config {}: {e}", path.display());
+            Config::default()
+        }
+    }
+}
+
+fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("vialctl")
+        .join("config.toml")
+}
+
 #[derive(Parser)]
 #[command(
+    version,
     about = "Set RGB color on keyboards running Vial firmware with RGB support",
-    after_help = "Examples:\n  vialctl ff00ff\n  vialctl '#00ff00'\n  vialctl ff0000 --brightness 80"
+    after_help = format!(
+        "Examples:\n  vialctl ff00ff\n  vialctl '#00ff00'\n  vialctl ff0000 --brightness 80\n\n\
+         Config: {}\n  Example:\n    white_point = [200, 255, 230]",
+        config_path().display()
+    )
 )]
 struct Cli {
-    /// Hex color code, e.g. ff00ff or #ff00ff
     #[arg(value_name = "HEX_COLOR")]
     color: String,
 
-    /// Override brightness/value (0-255). If not set, uses the color's own brightness.
     #[arg(short, long)]
     brightness: Option<u8>,
 
-    /// Don't save the setting to the keyboard's EEPROM (temporary until reboot).
     #[arg(long)]
     no_save: bool,
+
+    #[arg(long, value_name = "R,G,B", value_parser = parse_white_point)]
+    white_point: Option<[u8; 3]>,
+}
+
+fn parse_white_point(s: &str) -> Result<[u8; 3], String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return Err("expected 3 comma-separated values, e.g. 200,255,230".into());
+    }
+    let r = parts[0]
+        .trim()
+        .parse::<u8>()
+        .map_err(|e| format!("red: {e}"))?;
+    let g = parts[1]
+        .trim()
+        .parse::<u8>()
+        .map_err(|e| format!("green: {e}"))?;
+    let b = parts[2]
+        .trim()
+        .parse::<u8>()
+        .map_err(|e| format!("blue: {e}"))?;
+    if r == 0 || g == 0 || b == 0 {
+        return Err("white point channels must be 1-255".into());
+    }
+    Ok([r, g, b])
 }
 
 fn hid_send(dev: &HidDevice, msg: &[u8], retries: u32) -> Result<[u8; MSG_LEN]> {
@@ -45,32 +121,21 @@ fn hid_send(dev: &HidDevice, msg: &[u8], retries: u32) -> Result<[u8; MSG_LEN]> 
     buf[1..=msg.len()].copy_from_slice(msg);
 
     let mut data = [0u8; MSG_LEN];
-    let mut last_err = None;
 
     for attempt in 0..retries {
         if attempt > 0 {
             thread::sleep(Duration::from_millis(500));
         }
-        match dev.write(&buf) {
-            Ok(_) => {}
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
+        if let Err(_e) = dev.write(&buf) {
+            continue;
         }
         match dev.read_timeout(&mut data, 1000) {
             Ok(n) if n > 0 => return Ok(data),
-            Ok(_) => {}
-            Err(e) => {
-                last_err = Some(e);
-            }
+            _ => {}
         }
     }
 
-    match last_err {
-        Some(e) => bail!("failed to communicate with device: {e}"),
-        None => bail!("failed to communicate with device: no response"),
-    }
+    bail!("failed to communicate with device after {retries} attempts");
 }
 
 fn is_rawhid(api: &HidApi, info: &DeviceInfo) -> bool {
@@ -117,7 +182,7 @@ fn vialrgb_get_modes(dev: &HidDevice) -> Result<BTreeSet<u16>> {
     let mut effects = BTreeSet::from([0u16]);
     let mut max_effect: u16 = 0;
 
-    loop {
+    for _ in 0..MAX_EFFECT_QUERY_ROUNDS {
         let mut msg = [0u8; MSG_LEN];
         msg[0] = CMD_VIA_LIGHTING_GET_VALUE;
         msg[1] = VIALRGB_GET_SUPPORTED;
@@ -136,6 +201,11 @@ fn vialrgb_get_modes(dev: &HidDevice) -> Result<BTreeSet<u16>> {
             break;
         }
     }
+
+    ensure!(
+        max_effect == 0xFFFF,
+        "device reported too many effects (>{MAX_EFFECT_QUERY_ROUNDS} rounds without terminator)"
+    );
 
     Ok(effects)
 }
@@ -158,19 +228,34 @@ fn vialrgb_save(dev: &HidDevice) -> Result<()> {
     Ok(())
 }
 
-fn hex_to_hsv(hex: &str) -> Result<(u8, u8, u8)> {
+fn parse_hex_rgb(hex: &str) -> Result<(u8, u8, u8)> {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
     if hex.len() != 6 || !hex.is_ascii() {
         bail!("color must be 6 hex characters (0-9, a-f), e.g. ff00ff");
     }
 
-    let red = f64::from(u8::from_str_radix(&hex[0..2], 16).context("invalid red component")?);
-    let green = f64::from(u8::from_str_radix(&hex[2..4], 16).context("invalid green component")?);
-    let blue = f64::from(u8::from_str_radix(&hex[4..6], 16).context("invalid blue component")?);
+    let r = u8::from_str_radix(&hex[0..2], 16).context("invalid red component")?;
+    let g = u8::from_str_radix(&hex[2..4], 16).context("invalid green component")?;
+    let b = u8::from_str_radix(&hex[4..6], 16).context("invalid blue component")?;
 
-    let red = red / 255.0;
-    let green = green / 255.0;
-    let blue = blue / 255.0;
+    Ok((r, g, b))
+}
+
+fn apply_white_point(r: u8, g: u8, b: u8, white_point: [u8; 3]) -> (u8, u8, u8) {
+    let [wr, wg, wb] = white_point;
+    // Scale each channel down proportionally: if white_point blue is 200, blue gets reduced to 200/255
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    (
+        (f64::from(r) * f64::from(wr) / 255.0).round() as u8,
+        (f64::from(g) * f64::from(wg) / 255.0).round() as u8,
+        (f64::from(b) * f64::from(wb) / 255.0).round() as u8,
+    )
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    let red = f64::from(r) / 255.0;
+    let green = f64::from(g) / 255.0;
+    let blue = f64::from(b) / 255.0;
 
     let max = red.max(green).max(blue);
     let delta = max - red.min(green).min(blue);
@@ -189,19 +274,28 @@ fn hex_to_hsv(hex: &str) -> Result<(u8, u8, u8)> {
 
     // Values are guaranteed to be in 0.0..=255.0 by the HSV math above
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (hue, sat, val) = (
+    (
         (hue / 360.0 * 255.0).round() as u8,
         (sat * 255.0).round() as u8,
         (max * 255.0).round() as u8,
-    );
-
-    Ok((hue, sat, val))
+    )
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = load_config();
 
-    let (hue, sat, mut val) = hex_to_hsv(&cli.color)?;
+    let white_point = cli.white_point.or(config.white_point);
+    let (r, g, b) = parse_hex_rgb(&cli.color)?;
+    let (r, g, b) = match white_point {
+        Some(wp) => apply_white_point(r, g, b, wp),
+        None => (r, g, b),
+    };
+    let (hue, sat, mut val) = rgb_to_hsv(r, g, b);
+
+    if let Some(wp) = white_point {
+        println!("Color correction: white_point = {wp:?}");
+    }
 
     if let Some(brightness) = cli.brightness {
         val = brightness;
@@ -228,7 +322,14 @@ fn main() -> Result<()> {
     let color_hex = cli.color.trim_start_matches('#');
     println!("Setting color to #{color_hex} (HSV: {hue}, {sat}, {val})");
 
-    vialrgb_set_mode(&dev, VIALRGB_EFFECT_SOLID_COLOR, 128, hue, sat, val)?;
+    vialrgb_set_mode(
+        &dev,
+        VIALRGB_EFFECT_SOLID_COLOR,
+        DEFAULT_EFFECT_SPEED,
+        hue,
+        sat,
+        val,
+    )?;
 
     if cli.no_save {
         println!("Done! (not saved to EEPROM)");
