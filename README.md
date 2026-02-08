@@ -2,6 +2,8 @@
 
 Set RGB color on keyboards running Vial firmware with RGB support. Works with split keyboards.
 
+Developed for use with [Omarchy](https://github.com/basecamp/omarchy) keyboard RGB theme settings.
+
 > **Note:** This utility currently supports setting solid colors. More features (effects, per-key control, etc.) will be added in future releases.
 
 ## Usage
