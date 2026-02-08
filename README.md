@@ -2,6 +2,8 @@
 
 Set RGB color on a VialRGB keyboard. Works with split keyboards.
 
+> **Note:** This utility currently supports setting solid colors. More features (effects, per-key control, etc.) will be added in future releases.
+
 ## Usage
 
 ```
