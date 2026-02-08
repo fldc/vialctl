@@ -17,8 +17,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
             cross: false
           - target: aarch64-unknown-linux-gnu
+            name: linux-aarch64
             cross: true
 
     steps:
@@ -50,12 +52,12 @@ jobs:
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czvf ../../../vialctl-${{ github.ref_name }}-${{ matrix.target }}.tar.gz vialctl
+          tar czvf ../../../vialctl-${{ github.ref_name }}-${{ matrix.name }}.tar.gz vialctl
 
       - uses: actions/upload-artifact@v6
         with:
-          name: vialctl-${{ matrix.target }}
-          path: vialctl-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          name: vialctl-${{ matrix.name }}
+          path: vialctl-${{ github.ref_name }}-${{ matrix.name }}.tar.gz
 
   release:
     name: Create Release
