@@ -21,7 +21,7 @@ const VIALRGB_SET_MODE: u8 = 0x41;
 
 #[derive(Parser)]
 #[command(
-    about = "Set RGB color on a VialRGB keyboard",
+    about = "Set RGB color on keyboards running Vial firmware with RGB support",
     after_help = "Examples:\n  vialctl ff00ff\n  vialctl '#00ff00'\n  vialctl ff0000 --brightness 80"
 )]
 struct Cli {
@@ -41,7 +41,6 @@ struct Cli {
 fn hid_send(dev: &HidDevice, msg: &[u8], retries: u32) -> Result<[u8; MSG_LEN]> {
     ensure!(msg.len() <= MSG_LEN, "message must be <= {MSG_LEN} bytes");
 
-    // Pad message to MSG_LEN, with a leading 0x00 report ID byte
     let mut buf = [0u8; MSG_LEN + 1];
     buf[1..=msg.len()].copy_from_slice(msg);
 
@@ -112,7 +111,7 @@ fn vialrgb_get_modes(dev: &HidDevice) -> Result<BTreeSet<u16>> {
     let data = hid_send(dev, &[CMD_VIA_LIGHTING_GET_VALUE, VIALRGB_GET_INFO], 20)?;
     let rgb_version = u16::from_le_bytes([data[2], data[3]]);
     if rgb_version != 1 {
-        bail!("unsupported VialRGB protocol ({rgb_version})");
+        bail!("unsupported Vial RGB protocol ({rgb_version})");
     }
 
     let mut effects = BTreeSet::from([0u16]);
@@ -210,7 +209,7 @@ fn main() -> Result<()> {
 
     let api = HidApi::new().context("failed to initialize HID API")?;
 
-    let info = find_vial_device(&api).context("no VialRGB device found")?;
+    let info = find_vial_device(&api).context("no Vial RGB device found")?;
 
     println!(
         "Found: {} {}",
