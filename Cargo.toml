@@ -1,6 +1,6 @@
 [package]
 name = "vialctl"
-version = "0.2.0"
+version = "0.2.5"
 edition = "2024"
 authors = ["Fredrik Storm <fredrik@fldc.se>"]
 description = "Control Vial-compatible keyboards from the command line"
